@@ -59,7 +59,7 @@ stateDiagram-v2
 | PhysicsEngine | Applies gravity + flap velocity to Ghosty |
 | PipeManager | Spawns, scrolls, and culls pipe pairs |
 | ParallaxSystem | Manages cloud layers at varying speeds/opacities |
-| CollisionDetector | AABB overlap checks between Ghosty and pipes/edges |
+| CollisionDetector | Circle-vs-rect checks between Ghosty and pipes; scalar ceiling/ground checks |
 | ScoreManager | Tracks current score, updates and persists high score |
 | AudioManager | Loads and plays jump.wav / game_over.wav |
 | Renderer | Draws all visual elements to the canvas each frame |
@@ -104,7 +104,9 @@ parallaxSystem.reset()
 ### CollisionDetector
 
 ```js
+// Uses circle-vs-rect for pipe collisions, scalar comparisons for ceiling/ground
 collisionDetector.check(ghostState, pipes, canvasHeight, scoreBarHeight) → boolean
+// ghostState must include: { x, y, width, height } — center and radius derived internally
 ```
 
 ### ScoreManager
@@ -152,7 +154,8 @@ const STATE = { START: 'start', PLAYING: 'playing', GAMEOVER: 'gameover' }
   y: number,       // vertical position (top of sprite)
   vy: number,      // vertical velocity (positive = downward)
   width: number,   // sprite render width
-  height: number   // sprite render height
+  height: number,  // sprite render height
+  // collision circle derived from config: center = (x + width/2, y + height/2), r = GHOSTY_RADIUS
 }
 ```
 
@@ -160,11 +163,12 @@ const STATE = { START: 'start', PLAYING: 'playing', GAMEOVER: 'gameover' }
 
 ```js
 {
-  x: number,       // left edge of pipe column
-  gapTop: number,  // y coordinate of top of gap
+  x: number,         // left edge of pipe column
+  gapTop: number,    // y coordinate of top of gap
   gapBottom: number, // y coordinate of bottom of gap
-  width: number,   // pipe column width
-  passed: boolean  // true once Ghosty's center has crossed pipe center
+  width: number,     // pipe column width
+  passed: boolean,   // true once Ghosty's center has crossed pipe center
+  active: boolean    // pool flag: true = in use, false = available for reuse
 }
 ```
 
@@ -191,24 +195,145 @@ const STATE = { START: 'start', PLAYING: 'playing', GAMEOVER: 'gameover' }
 
 ### Constants (tunable)
 
+All numerical constants are extracted into a dedicated `config.js` file, loaded before `game.js` in `index.html`. This separates tunable parameters from game logic and makes balancing changes straightforward without touching game code.
+
+**`config.js` structure (grouped by category):**
+
 ```js
+// config.js — all tunable constants, grouped by category
+
+// Physics
 const GRAVITY          = 1800   // px/s²
 const FLAP_VELOCITY    = -520   // px/s (upward)
 const TERMINAL_VEL     = 900    // px/s (downward cap)
+const DELTA_TIME_CAP   = 0.1    // seconds — max dt to prevent physics explosion on tab blur
+
+// Pipes
 const PIPE_SPEED       = 200    // px/s
 const PIPE_INTERVAL    = 300    // px scrolled between spawns
 const PIPE_WIDTH       = 60     // px
 const PIPE_GAP         = 160    // px vertical gap height
 const PIPE_GAP_MIN_Y   = 80     // px from top (min gap top)
+const PIPE_POOL_SIZE   = 10     // pre-allocated pipe objects in the pool
+
+// Ghosty
 const GHOSTY_WIDTH     = 48     // px
 const GHOSTY_HEIGHT    = 48     // px
+const GHOSTY_RADIUS    = 18     // px — collision circle radius (slightly smaller than sprite)
+
+// UI
 const SCORE_BAR_HEIGHT = 48     // px
+
+// Clouds
 const CLOUD_LAYERS     = [
   { speed: 30,  opacity: 0.25, scale: 0.6 },  // far/slow
   { speed: 70,  opacity: 0.45, scale: 1.0 },  // near/fast
 ]
 ```
 
+**`index.html` load order:**
+
+```html
+<script src="config.js"></script>
+<script src="game.js"></script>
+```
+
+
+---
+
+## Collision Detection
+
+### Ghosty — Circular Hitbox
+
+Rather than using an AABB for Ghosty, a circle hitbox is used. This better matches the rounded ghost sprite and feels fairer to the player (avoids corner-pixel deaths).
+
+```
+center_x = ghosty.x + ghosty.width  / 2
+center_y = ghosty.y + ghosty.height / 2
+radius   = GHOSTY_RADIUS   // defined in config.js, slightly smaller than sprite
+```
+
+### Pipe Walls — Rectangular AABB
+
+Each pipe column is a plain axis-aligned rectangle:
+
+```
+top pipe:    { x: pipe.x, y: 0,            w: pipe.width, h: pipe.gapTop }
+bottom pipe: { x: pipe.x, y: pipe.gapBottom, w: pipe.width, h: canvasHeight - pipe.gapBottom }
+```
+
+### Ground / Ceiling Detection
+
+- Ceiling: collision when `center_y - radius < 0`
+- Ground: collision when `center_y + radius > canvasHeight - SCORE_BAR_HEIGHT`
+
+These are simple scalar comparisons — no rectangle needed.
+
+### Circle vs. Rectangle Algorithm (Ghosty vs. Pipe)
+
+To test whether a circle overlaps an AABB, clamp the circle center to the rectangle bounds and compare the squared distance to the squared radius:
+
+```js
+function circleVsRect(cx, cy, r, rx, ry, rw, rh) {
+  // Find the closest point on the rect to the circle center
+  const nearestX = Math.max(rx, Math.min(cx, rx + rw))
+  const nearestY = Math.max(ry, Math.min(cy, ry + rh))
+  const dx = cx - nearestX
+  const dy = cy - nearestY
+  return dx * dx + dy * dy < r * r
+}
+```
+
+This is called twice per pipe pair (once for the top rect, once for the bottom rect).
+
+---
+
+## Performance
+
+### Target Frame Rate
+
+The game targets **60 FPS** via `requestAnimationFrame`. No fixed timestep is used; instead, `deltaTime` is computed each frame and capped:
+
+```js
+const dt = Math.min((now - lastTime) / 1000, DELTA_TIME_CAP)  // DELTA_TIME_CAP = 0.1s
+```
+
+Capping `dt` prevents the physics engine from producing large position jumps when the tab is backgrounded and then foregrounded.
+
+### Sprite Batching
+
+To minimize canvas state changes each frame:
+
+1. Set `ctx.globalAlpha` and `ctx.fillStyle` once per logical group, not per object.
+2. Draw all clouds in a single pass grouped by layer (same opacity/scale per layer).
+3. Draw all pipes in a single pass (same fill style for all pipe bodies, then a second pass for caps).
+4. Draw Ghosty last among game objects (single `drawImage` call).
+5. Draw the score bar UI on top in one pass.
+
+Avoid saving/restoring canvas state inside tight loops; only save/restore around the full render function if needed.
+
+### Object Pooling for Pipes
+
+Instead of allocating new pipe objects on each spawn and letting the GC collect off-screen ones, a fixed-size pool is pre-allocated at init time:
+
+```js
+// Pre-allocate pool at startup
+const pipePool = Array.from({ length: PIPE_POOL_SIZE }, () => ({
+  x: 0, gapTop: 0, gapBottom: 0, width: PIPE_WIDTH, passed: false, active: false
+}))
+
+function acquirePipe() {
+  return pipePool.find(p => !p.active) ?? null  // returns null if pool exhausted
+}
+
+function releasePipe(pipe) {
+  pipe.active = false  // returns it to the pool
+}
+```
+
+`PipeManager.update()` calls `releasePipe()` on any pipe whose `x + width <= 0`, and calls `acquirePipe()` + resets fields when spawning a new pair. `getPipes()` returns only pipes where `active === true`.
+
+`PIPE_POOL_SIZE` (default 10) is defined in `config.js` and should comfortably exceed the maximum number of pipes visible on screen at any canvas width.
 
 ---
 
@@ -266,7 +391,7 @@ const CLOUD_LAYERS     = [
 
 ### Property 7: Collision detection triggers game over
 
-*For any* Ghosty bounding box and pipe configuration where the boxes overlap, or where Ghosty's bounding box exceeds the canvas top or score bar bottom, `collisionDetector.check()` should return `true` and the game should transition to `gameover`.
+*For any* Ghosty circle (center, radius) and pipe configuration where the circle overlaps a pipe rectangle (via circle-vs-rect), or where Ghosty's circle exceeds the canvas top or score bar bottom, `collisionDetector.check()` should return `true` and the game should transition to `gameover`.
 
 **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
 
@@ -376,7 +501,7 @@ Each test must include a comment tag in the format:
 | Property 4 | For random vy > TERMINAL_VEL, update clamps to TERMINAL_VEL |
 | Property 5 | For random pipes and dt, x decreases correctly; off-screen pipes are culled |
 | Property 6 | For random canvas heights, spawned pipe gapTop is always within bounds |
-| Property 7 | For random overlapping/non-overlapping bounding boxes, collision check is correct |
+| Property 7 | For random circle/rect configurations, circle-vs-rect collision check returns correct result |
 | Property 8 | For random pipe positions and ghost x values, score increments exactly once per pipe |
 | Property 9 | For random (score, highScore) pairs where score > highScore, localStorage is updated |
 | Property 10 | For random gameover states and dt values, update produces no state changes |
@@ -389,6 +514,7 @@ Each test must include a comment tag in the format:
 
 ```
 index.html          ← game entry point
-game.js             ← all game logic
+config.js           ← all tunable constants grouped by category
+game.js             ← all game logic (reads constants from config.js globals)
 game.test.js        ← unit + property tests (using fast-check + vitest or jest)
 ```
